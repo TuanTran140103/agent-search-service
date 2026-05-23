@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from langgraph.graph import MessagesState
+# AgentState is now managed internally by DeepAgents.
+# This module is kept as a compatibility shim in case other
+# parts of the codebase import from here.
+from langgraph.graph import MessagesState as AgentState
 
-
-class AgentState(MessagesState):
-    instructions: str = ""
+__all__ = ["AgentState"]

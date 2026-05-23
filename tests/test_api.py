@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from fastapi.testclient import TestClient
 
 
+def _tid(prefix: str = "t") -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+_HDRS = {"X-User-Id": "test-user"}
+
+
 @pytest.fixture
 def client():
-    from src.container import reset_container, init_container
+    from src.api.server import app
+    from src.container import reset_container
 
     reset_container()
-    init_container()
-
-    from src.api.server import app
-
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
+    reset_container()
 
 
 def test_health(client):
@@ -41,133 +48,9 @@ def test_list_agents(client):
     assert data["agents"][0]["endpoint"] == "/agent"
 
 
-def test_create_and_list_threads(client):
-    resp = client.post("/threads", json={})
-    assert resp.status_code == 200
-    thread = resp.json()
-    assert "thread_id" in thread
-    assert thread["metadata"] == {}
-
-    resp = client.get("/threads")
-    assert resp.status_code == 200
-    threads = resp.json()["threads"]
-    assert len(threads) == 1
-
-
-def test_get_thread(client):
-    client.post("/threads", json={"thread_id": "my-thread"})
-    resp = client.get("/threads/my-thread")
-    assert resp.status_code == 200
-    assert resp.json()["thread_id"] == "my-thread"
-
-
-def test_get_thread_not_found(client):
-    resp = client.get("/threads/nonexistent")
-    assert resp.status_code == 404
-
-
-def test_delete_thread(client):
-    client.post("/threads", json={"thread_id": "del-me"})
-    resp = client.delete("/threads/del-me")
-    assert resp.status_code == 200
-    resp = client.get("/threads/del-me")
-    assert resp.status_code == 404
-
-
 def test_get_thread_state_empty_for_new_thread(client):
-    resp = client.post("/threads", json={})
-    tid = resp.json()["thread_id"]
+    tid = _tid("state")
     resp = client.get(f"/threads/{tid}/state")
-    assert resp.status_code == 200
-    assert resp.json()["messages"] == []
-
-
-def test_put_and_get_thread_state(client):
-    resp = client.post("/threads", json={"thread_id": "state-test"})
-    assert resp.status_code == 200
-
-    resp = client.put(
-        "/threads/state-test/state",
-        json={
-            "messages": [
-                {"role": "user", "content": "hello", "id": "u1"},
-                {"role": "assistant", "content": "hi there", "id": "a1"},
-            ]
-        },
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert len(data["messages"]) == 2
-
-    resp = client.get("/threads/state-test/state")
-    assert resp.status_code == 200
-    msgs = resp.json()["messages"]
-    assert len(msgs) == 2
-    assert msgs[0]["content"] == "hello"
-    assert msgs[1]["content"] == "hi there"
-
-
-def test_put_thread_state_preserves_existing(client):
-    resp = client.post("/threads", json={"thread_id": "append-test"})
-    assert resp.status_code == 200
-
-    resp = client.put(
-        "/threads/append-test/state",
-        json={"messages": [{"role": "user", "content": "first", "id": "u1"}]},
-    )
-    assert resp.status_code == 200
-    assert len(resp.json()["messages"]) == 1
-
-    resp = client.put(
-        "/threads/append-test/state",
-        json={"messages": [{"role": "assistant", "content": "second", "id": "a1"}]},
-    )
-    assert resp.status_code == 200
-    assert len(resp.json()["messages"]) == 2
-
-    resp = client.get("/threads/append-test/state")
-    assert len(resp.json()["messages"]) == 2
-
-
-def test_thread_state_history(client):
-    resp = client.post("/threads", json={"thread_id": "history-test"})
-    assert resp.status_code == 200
-
-    resp = client.get("/threads/history-test/state/history")
-    assert resp.status_code == 200
-    assert len(resp.json()["checkpoints"]) >= 1
-
-    resp = client.put(
-        "/threads/history-test/state",
-        json={"messages": [{"role": "user", "content": "msg", "id": "m1"}]},
-    )
-    assert resp.status_code == 200
-
-    resp = client.get("/threads/history-test/state/history")
-    assert len(resp.json()["checkpoints"]) >= 2
-
-    # Verify first checkpoint has empty messages, second has the msg
-    cps = resp.json()["checkpoints"]
-    assert cps[0]["message_count"] == 1
-    assert cps[1]["message_count"] == 0
-
-
-def test_delete_thread_clears_checkpointer(client):
-    resp = client.post("/threads", json={"thread_id": "clear-test"})
-    assert resp.status_code == 200
-
-    client.put(
-        "/threads/clear-test/state",
-        json={"messages": [{"role": "user", "content": "x", "id": "x1"}]},
-    )
-
-    resp = client.get("/threads/clear-test/state")
-    assert len(resp.json()["messages"]) == 1
-
-    resp = client.delete("/threads/clear-test")
-    assert resp.status_code == 200
-
-    resp = client.get("/threads/clear-test/state")
     assert resp.status_code == 200
     assert resp.json()["messages"] == []
 
@@ -193,14 +76,105 @@ def test_agent_post_validation(client, body):
     assert resp.status_code == 422
 
 
-def test_rate_limiter_rejects_after_limit():
-    from src.ratelimit.memory import InMemoryRateLimiter
+def _setup_thread_state(tid: str, messages: list[tuple[str, str, str]]):
+    """Helper: use graph.astream to seed checkpoints through the middleware.
 
-    limiter = InMemoryRateLimiter(per_user=1, global_limit=100, window=60)
-
+    Each tuple is (id, role, content).
+    """
     import asyncio
-    r1 = asyncio.run(limiter.check("test-user"))
-    assert r1.allowed is True
 
-    r2 = asyncio.run(limiter.check("test-user"))
-    assert r2.allowed is False
+    from src.container import get_container
+    from ag_ui_langgraph.utils import agui_messages_to_langchain
+
+    graph = get_container().graph()
+    config = {"configurable": {"thread_id": tid}}
+
+    async def _seed():
+        accumulated = []
+        for msg_id, role, content in messages:
+            accumulated.append({"id": msg_id, "role": role, "content": content})
+            agui_objs = [_dict_to_agui(m) for m in accumulated]
+            lc = agui_messages_to_langchain(agui_objs)
+            async for _ in graph.astream(
+                {"messages": lc},
+                stream_mode="updates",
+                config=config,
+                interrupt_before=["model"],
+            ):
+                pass
+
+    asyncio.run(_seed())
+
+
+def _dict_to_agui(data: dict):
+    """Replica of server's _to_agui_message for test access."""
+    role = data.get("role", "")
+    if role == "user":
+        from ag_ui.core.types import UserMessage
+        return UserMessage(**data)
+    elif role == "assistant":
+        from ag_ui.core.types import AssistantMessage
+        return AssistantMessage(**data)
+    raise ValueError(f"Unsupported role: {role}")
+
+
+def test_patch_thread_state_requires_messages(client):
+    tid = _tid("patch")
+    resp = client.patch(f"/threads/{tid}/state", json={})
+    assert resp.status_code == 400
+    assert "messages" in resp.text.lower()
+
+
+def test_patch_thread_state_message_not_found(client):
+    tid = _tid("patch")
+    resp = client.patch(
+        f"/threads/{tid}/state",
+        json={"messages": [{"id": "nonexistent", "role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 404
+
+
+def test_patch_thread_state_edits_message(client):
+    tid = _tid("patch")
+    msg_id = "edit-me"
+
+    _setup_thread_state(tid, [("a", "user", "hello"), (msg_id, "user", "original"), ("c", "user", "third")])
+
+    new_content = "edited content"
+    resp = client.patch(
+        f"/threads/{tid}/state",
+        json={
+            "messages": [{"id": msg_id, "role": "user", "content": new_content}],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    msgs = data["messages"]
+
+    # Verify message was updated
+    edited = [m for m in msgs if m.get("id") == msg_id]
+    assert len(edited) == 1
+    assert edited[0]["content"] == new_content
+
+    # Messages after the edit point are dropped.
+    ids = {m["id"] for m in msgs}
+    assert "a" in ids
+    assert "c" not in ids
+
+
+def test_fork_thread_creates_new_thread(client):
+    tid = _tid("fork")
+    msg_id = "fork-msg"
+
+    _setup_thread_state(tid, [(msg_id, "user", "source message")])
+
+    new_tid = _tid("fork-target")
+    resp = client.post(
+        f"/threads/{tid}/fork",
+        json={"new_thread_id": new_tid},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["thread_id"] == new_tid
+    assert len(data["messages"]) > 0
+    assert data["messages"][0]["id"] == msg_id

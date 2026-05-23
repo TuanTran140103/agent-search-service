@@ -56,9 +56,16 @@ class SearchService:
         resp.raise_for_status()
         return DocumentDetail(**resp.json())
 
-    async def list_dataset_documents(self, dataset_id: str) -> list[DocumentRef]:
+    async def get_recent_documents(
+        self,
+        n: int = 10,
+        dataset_ids: Optional[list[str]] = None,
+    ) -> list[DocumentRef]:
         client = await self._get_client()
-        resp = await client.get(f"/datasets/{dataset_id}/documents")
+        params: dict = {"n": n}
+        if dataset_ids:
+            params["datasetIds"] = ",".join(dataset_ids)
+        resp = await client.get("/documents/recent", params=params)
         resp.raise_for_status()
         return [DocumentRef(**item) for item in resp.json()]
 

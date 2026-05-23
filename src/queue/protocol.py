@@ -4,6 +4,7 @@ import abc
 from typing import AsyncIterator
 
 from ag_ui.core import BaseEvent, RunAgentInput
+from ag_ui_langgraph import LangGraphAgent
 
 
 class MessageQueue(abc.ABC):
@@ -16,7 +17,13 @@ class MessageQueue(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def start_worker(self, agents: dict[str, object]) -> None:
+    async def shutdown(self) -> None:
+        ...
+
+
+class Worker(abc.ABC):
+    @abc.abstractmethod
+    async def start(self, agents: dict[str, LangGraphAgent]) -> None:
         ...
 
     @abc.abstractmethod

@@ -2,6 +2,8 @@
 
 Base URL: `http://<host>:8000`
 
+> **Authentication**: Mọi request được nginx proxy qua, nginx inject header `X-User-Id`. Frontend không cần tự gửi auth.
+
 ---
 
 ## 1. Send Message (SSE Stream)
@@ -270,78 +272,95 @@ RUN_FINISHED
 
 ---
 
-## 2. List Threads
+## 2. Edit Message (No LLM)
 
-**`GET /threads`**
+**`PATCH /threads/{thread_id}/state`**
 
-### Response
+Edit message hiện có và xóa toàn bộ messages phía sau nó. **Không gọi LLM** — chỉ commit state mới và trả về messages list.
 
-```json
-{
-  "threads": [
-    {
-      "thread_id": "550e8400-e29b-41d4-a716-446655440000",
-      "metadata": {}
-    }
-  ]
-}
-```
-
----
-
-## 3. Create Thread
-
-**`POST /threads`**
-
-Tự động khởi tạo checkpointer state cho thread mới (nên `GET .../state` luôn trả về hợp lệ).
+> Dùng khi user nhấn "Edit" trên một message. Sau đó frontend tự gọi `POST /agent` để lấy AI response mới.
 
 ### Request
 
 ```json
 {
-  "thread_id": "550e8400-e29b-41d4-a716-446655440000",
-  "metadata": {}
+  "messages": [
+    {
+      "id": "msg-001",
+      "role": "user",
+      "content": "Nội dung mới sau khi edit"
+    }
+  ]
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `thread_id` | string | no | Tự sinh UUID nếu không truyền |
-| `metadata` | object | no | Metadata tuỳ ý |
+| `messages` | array | **yes** | Messages cần edit (phải có `id` trùng với message hiện có). Có thể gửi nhiều message cùng lúc. |
 
-### Response
+**Quy tắc:**
+- `id` trong body **phải trùng** với 1 message trong thread hiện tại
+- Server tìm **vị trí cuối cùng** của message được edit trong danh sách hiện tại
+- Giữ nguyên tất cả messages **trước** message đó
+- **Thay thế** message bằng nội dung mới (dùng `RemoveMessage` của LangChain, tương thích với `DeltaChannel` reducer của DeepAgents)
+- **Xóa toàn bộ** messages phía sau
 
-```json
-{
-  "thread_id": "550e8400-e29b-41d4-a716-446655440000",
-  "metadata": {}
-}
-```
+### Response — Full Conversation List
 
----
-
-## 4. Get Thread Detail
-
-**`GET /threads/{thread_id}`**
-
-### Response
+Server trả về **toàn bộ các messages còn lại** sau khi edit (không phải chỉ riêng message vừa edit).
 
 ```json
 {
   "thread_id": "550e8400-e29b-41d4-a716-446655440000",
-  "metadata": {}
+  "checkpoint_id": "1f154ff6-dcb0-6055-8003-333ac6e023b8",
+  "messages": [
+    {"id": "msg-000", "role": "user", "content": "Hello"},
+    {"id": "msg-001", "role": "user", "content": "Nội dung mới sau khi edit"}
+  ]
 }
 ```
 
-> Chỉ trả về metadata, **không** có messages.
+| Field | Description |
+|---|---|
+| `thread_id` | UUID thread |
+| `checkpoint_id` | Checkpoint mới vừa được tạo (`next=["model"]` - đang chờ LLM) |
+| `messages` | **Full conversation list** (tất cả messages còn lại) |
+
+### Frontend Flow
+
+```
+User nhấn "Edit" message msg-001
+  |
+  ├── Frontend xóa UI các messages phía dưới msg-001
+  ├── User nhập nội dung mới
+  ├── PATCH /threads/{id}/state
+  │     Body: {"messages": [{"id":"msg-001","role":"user","content":"mới"}]}
+  │     → Server: giữ msg-000, thay msg-001, xóa msg-002,003...
+  │     ← Response: { messages: [msg-000, msg-001(mới)] }  ← full list
+  ├── Frontend update UI với messages từ response
+  └── POST /agent
+        Body: {
+          "threadId": "...",
+          "runId": "uuid-mới",
+          "messages": [msg-000, msg-001(mới)]   ← copy từ PATCH response
+        }
+        → Worker: load checkpoint, nhận diện messages đều có trong checkpoint
+        → Chạy agent trên checkpoint hiện tại (không append message mới)
+        → SSE stream AI response mới
+        → Append AI response vào UI
+```
+
+> 💡 **Tại sao 2 bước?** PATCH chỉ commit state (không gọi LLM). POST /agent chạy LLM. Tách biệt cho phép frontend hiển thị "đang typing" hoặc xử lý UI trước khi stream bắt đầu.
+>
+> 🔹 **Quan trọng**: Client gửi `messages` trong POST /agent giống hệt `messages` từ PATCH response. Worker tự dùng checkpoint làm source of truth — chỉ append message thực sự mới (ID chưa có trong checkpoint), ignore stale data.
 
 ---
 
-## 5. Get Thread Messages (State)
+## 3. Get Thread Messages (State)
 
 **`GET /threads/{thread_id}/state`**
 
-Lấy toàn bộ messages từ LangGraph checkpointer. Cần gọi API này khi:
+Lấy toàn bộ messages từ PostgreSQL (PostgresSaver checkpointer). Cần gọi API này khi:
 - F5 refresh page
 - Mở lại app sau khi đóng
 
@@ -371,55 +390,7 @@ Luôn trả về 200 với `messages` array. Nếu thread chưa có tin nhắn n
 
 ---
 
-## 6. Save Messages to Thread
-
-**`PUT /threads/{thread_id}/state`**
-
-Ghi messages vào checkpointer. Dùng để:
-- Sync messages từ frontend lên server (nếu cần)
-- Append thêm messages vào thread history
-- Khôi phục state khi cần
-
-### Request
-
-```json
-{
-  "messages": [
-    {
-      "id": "msg-001",
-      "role": "user",
-      "content": "Hello"
-    },
-    {
-      "id": "msg-002",
-      "role": "assistant",
-      "content": "Hi! How can I help you today?"
-    }
-  ]
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `messages` | array | **yes** | Danh sách messages AG-UI format. Mỗi message cần có `role`, `id`, `content`. Messages mới được append vào existing history (add_messages reducer). |
-
-### Response
-
-```json
-{
-  "thread_id": "550e8400-e29b-41d4-a716-446655440000",
-  "messages": [
-    {"id": "msg-001", "role": "user", "content": "Hello"},
-    {"id": "msg-002", "role": "assistant", "content": "Hi! How can I help you today?"}
-  ]
-}
-```
-
-> **Lưu ý:** Sau khi `POST /agent` hoàn tất, worker tự động persist messages vào checkpointer. Chỉ cần dùng PUT này nếu frontend muốn sync state thủ công.
-
----
-
-## 7. Thread State History (Debug)
+## 4. Thread State History (Debug)
 
 **`GET /threads/{thread_id}/state/history`**
 
@@ -434,12 +405,17 @@ Liệt kê tất cả checkpoints của thread. Dùng để debug kiểm tra xem
     {
       "checkpoint_id": "1f1510c7-2c62-6d34-8000-fa90626048d7",
       "message_count": 0,
-      "next": []
+      "next": [],
+      "messages": []
     },
     {
       "checkpoint_id": "2f1510c7-2c62-6d34-8000-fa90626048d8",
       "message_count": 2,
-      "next": []
+      "next": [],
+      "messages": [
+        {"id": "msg-001", "role": "user", "content": "Hello"},
+        {"id": "msg-002", "role": "assistant", "content": "Hi!"}
+      ]
     }
   ]
 }
@@ -449,30 +425,14 @@ Liệt kê tất cả checkpoints của thread. Dùng để debug kiểm tra xem
 |---|---|
 | `checkpoint_id` | UUID của checkpoint |
 | `message_count` | Số messages trong checkpoint đó |
+| `messages` | Danh sách messages (ag-ui format) |
 | `next` | Các node tiếp theo (rỗng nếu graph đã kết thúc) |
 
 > Checkpoints được sắp xếp từ mới nhất tới cũ nhất.
 
 ---
 
-## 8. Delete Thread
-
-**`DELETE /threads/{thread_id}`**
-
-Xoá cả metadata (`_threads` dict) và checkpointer state (MemorySaver). Thread sẽ không còn xuất hiện trong `GET /threads` và `GET .../state` trả về `messages: []`.
-
-### Response
-
-```json
-{
-  "status": "deleted",
-  "thread_id": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
----
-
-## 9. List Agents
+## 5. List Agents
 
 **`GET /agents`**
 
@@ -491,7 +451,7 @@ Xoá cả metadata (`_threads` dict) và checkpointer state (MemorySaver). Threa
 
 ---
 
-## 10. Health Check
+## 6. Health Check
 
 **`GET /health`**
 ```json
@@ -537,28 +497,50 @@ data: {"type":"RUN_FINISHED","threadId":"uuid","runId":"uuid"}
 ## Typical Frontend Flow
 
 ```
-1. Mở app:
-   GET /threads ───→ list thread titles
-
-2. Click vào thread cũ:
+1. Mở app (thread cũ):
    Nếu có cache local → show messages ngay
-   Nếu không (F5)   → GET /threads/{id}/state → show messages
+   Nếu không (F5)   → GET /threads/{threadId}/state → show messages
 
-3. Gửi message:
-   POST /agent (SSE) → nhận token stream → render real-time
-                       nhận MESSAGES_SNAPSHOT → update local cache
-                       → worker tự động persist messages vào checkpointer
+2. Chat tiếp trong thread cũ:
+   POST /agent (SSE) với threadId + messages hiện tại
+   → Worker: checkpoint = source of truth, chỉ append user message thực sự mới
+   → Nhận token stream → render real-time
+   → Nhận MESSAGES_SNAPSHOT → update local cache
+   → Checkpointer tự động lưu messages
+
+3. Edit message (giống ChatGPT):
+   a. User nhấn "Edit" trên message N
+   b. Frontend xóa UI tất cả messages phía dưới message N
+   c. User nhập nội dung mới
+   d. PATCH /threads/{threadId}/state {"messages": [{"id":"...","content":"mới"}]}
+      ← Response: { messages: [full conversation list] }
+   e. Frontend update UI với messages từ response
+   f. POST /agent với messages = response.messages (copy nguyên bản)
+      → Worker: load checkpoint, payload IDs đều trong checkpoint
+      → Chạy agent trên checkpoint → stream AI response
+      → Append AI response vào UI
 
 4. Tạo thread mới:
-   POST /threads → lấy thread_id → POST /agent với thread_id đó
+   Frontend tự sinh UUID làm threadId
+   → POST /agent với threadId mới
+   → checkpointer auto-create thread khi lần đầu chạy
 ```
 
 ## Data Persistence Summary
 
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/agent` | POST | Gửi message → stream AI response (SSE) |
+| `/threads/{id}/state` | GET | Lấy messages hiện tại của thread |
+| `/threads/{id}/state` | PATCH | Edit message + xóa messages sau (không gọi LLM) |
+| `/threads/{id}/state/history` | GET | Liệt kê checkpoint history (debug) |
+| `/threads/{id}/fork` | POST | Copy thread sang thread mới |
+
 | Dữ liệu | Lưu ở đâu | Cách ghi | Cách đọc |
 |---|---|---|---|
-| Thread metadata | In-memory `_threads` dict | `POST /threads` | `GET /threads`, `GET /threads/{id}` |
-| Messages / State | LangGraph MemorySaver checkpointer | Tự động sau `POST /agent` hoặc `PUT /threads/{id}/state` | `GET /threads/{id}/state` |
-| Checkpoint history | MemorySaver | Tự động mỗi lần graph chạy | `GET /threads/{id}/state/history` |
+| Messages / State | PostgreSQL checkpoints table (PostgresSaver) | Tự động khi graph chạy (`astream`) | `GET /threads/{id}/state` |
+| Checkpoint history | PostgreSQL checkpoints table (PostgresSaver) | Tự động mỗi lần graph chạy | `GET /threads/{id}/state/history` |
 
-> ⚠️ MemorySaver là in-memory, mất khi restart server. Để persist qua restart, cấu hình PostgreSQL checkpointer trong `langgraph.json`.
+> ✅ Dữ liệu được persist trong PostgreSQL. Restart server không mất dữ liệu.
+> 🔹 ThreadId do **frontend tự tạo** (UUID). Server không quản lý CRUD thread.
+> 🔹 Quan hệ thread ↔ user do **server khác** quản lý.

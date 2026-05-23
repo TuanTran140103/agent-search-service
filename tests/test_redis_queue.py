@@ -97,37 +97,39 @@ async def test_subscribe_receives_events_then_stops(mock_redis, mock_pubsub):
 
 @pytest.mark.asyncio
 async def test_process_entry_events_are_published(mock_redis):
-    from src.queue.redis import RedisStreamQueue
+    from src.queue.redis import RedisStreamQueue, RedisStreamWorker
     from tests.conftest import FakeEvent, MockAgent
 
     agent = MockAgent(events=[FakeEvent("RUN_STARTED"), FakeEvent("RUN_FINISHED")])
     queue = RedisStreamQueue("redis://fake:6379/0")
+    worker = RedisStreamWorker(queue)
 
     with patch("redis.asyncio.from_url", return_value=mock_redis):
-        await queue.start_worker({"test-agent": agent})
+        await worker.start({"test-agent": agent})
         # call _process_entry directly with decoded dict
-        await queue._process_entry(
+        await worker._process_entry(
             mock_redis, "12345-0",
             {"run_id": "r1", "agent_name": "test-agent", "payload": _valid_payload()},
         )
-        await queue.shutdown()
+        await worker.shutdown()
 
     assert mock_redis.publish.await_count >= 1
 
 
 @pytest.mark.asyncio
 async def test_process_entry_unknown_agent_acks(mock_redis):
-    from src.queue.redis import RedisStreamQueue
+    from src.queue.redis import RedisStreamQueue, RedisStreamWorker
 
     queue = RedisStreamQueue("redis://fake:6379/0")
+    worker = RedisStreamWorker(queue)
 
     with patch("redis.asyncio.from_url", return_value=mock_redis):
-        await queue.start_worker({})
-        await queue._process_entry(
+        await worker.start({})
+        await worker._process_entry(
             mock_redis, "67890-0",
             {"run_id": "bad-run", "agent_name": "nonexistent", "payload": _valid_payload()},
         )
-        await queue.shutdown()
+        await worker.shutdown()
 
     mock_redis.xack.assert_awaited_once()
     mock_redis.publish.assert_not_awaited()

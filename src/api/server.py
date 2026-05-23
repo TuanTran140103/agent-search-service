@@ -1,101 +1,80 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
-
 from dotenv import load_dotenv
 
 load_dotenv()
 
 os.environ["LANGGRAPH_FAST_API"] = "true"
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
 from ag_ui.core import RunAgentInput
 from ag_ui.encoder import EventEncoder
+from dependency_injector.wiring import Provide, inject
 
-from src.container import get_queue, get_rate_limiter, get_settings, init_container
-from src.core.log import bind_context, clear_context, configure_logging, get_logger
-from src.graph_builder import create_agent, get_checkpointer, graph as agent_graph
+from src.api.schemas import UpdateStateRequest, ForkThreadRequest
+from src.container import ApplicationContainer, get_container, init_container
+from src.core.log import configure_logging, get_logger
 
 logger = get_logger("api")
 
 
-class ThreadCreate(BaseModel):
-    thread_id: Optional[str] = None
-    metadata: Optional[dict] = None
-
-
-class ThreadResponse(BaseModel):
-    thread_id: str
-    metadata: dict = {}
-
-
-class ThreadStateUpdate(BaseModel):
-    messages: list[dict]
-    """List of AG-UI messages to append to thread state."""
-
-
-AGUI_ROLE_MAP: dict[str, type] = {}
-
-
-def _get_agui_message_class(role: str):
-    global AGUI_ROLE_MAP
-    if not AGUI_ROLE_MAP:
-        from ag_ui.core import (
-            AssistantMessage,
-            SystemMessage,
-            ToolMessage,
-            UserMessage,
-        )
-
-        AGUI_ROLE_MAP = {
-            "user": UserMessage,
-            "assistant": AssistantMessage,
-            "system": SystemMessage,
-            "tool": ToolMessage,
-        }
-    cls = AGUI_ROLE_MAP.get(role)
-    if cls is None:
-        raise ValueError(f"Unknown AG-UI message role: {role}")
-    return cls
-
-
-_threads: dict[str, dict] = {}
+def _to_agui_message(data: dict):
+    role = data.get("role", "")
+    if role == "user":
+        from ag_ui.core.types import UserMessage
+        return UserMessage(**data)
+    elif role == "assistant":
+        from ag_ui.core.types import AssistantMessage
+        return AssistantMessage(**data)
+    elif role == "tool":
+        from ag_ui.core.types import ToolMessage
+        return ToolMessage(**data)
+    elif role == "system":
+        from ag_ui.core.types import SystemMessage
+        return SystemMessage(**data)
+    raise HTTPException(status_code=400, detail=f"Unsupported message role: {role}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_container()
-    settings = get_settings()
-
-    agents = _build_agents()
+    c = get_container()
 
     logger.info(
         "server_startup",
-        backend=settings.queue_backend,
-        agent=settings.agent_name,
+        agent=c.settings().agent_name,
     )
 
-    if settings.queue_backend == "inprocess":
-        queue = get_queue()
-        await queue.start_worker(agents)
+    try:
+        pool = c.db_pool()
+        if pool is not None and pool.closed:
+            if sys.platform == "win32":
+                loop = asyncio.get_running_loop()
+                if isinstance(loop, asyncio.ProactorEventLoop):
+                    raise RuntimeError(
+                        "psycopg requires SelectorEventLoop on Windows. "
+                        "Run via 'python main.py' instead of uvicorn/gunicorn directly."
+                    )
+            await pool.open()
+            checkpointer = c.checkpointer()
+            await checkpointer.setup()
+    except Exception:
+        logger.warning("db_checkpointer_setup_failed", exc_info=True)
 
     yield
 
     logger.info("server_shutdown")
-    await get_queue().shutdown()
-
-
-def _build_agents() -> dict:
-    settings = get_settings()
-    agent = create_agent(name=settings.agent_name, description=settings.agent_description)
-    return {settings.agent_name: agent}
+    await c.queue().shutdown()
 
 
 def create_app() -> FastAPI:
@@ -124,35 +103,33 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def logging_middleware(request: Request, call_next):
         request_id = str(uuid.uuid4())[:8]
-        bind_context(
-            request_id=request_id,
-            method=request.method,
-            path=request.url.path,
-        )
-        logger.info("request_start")
+        method = request.method
+        path = request.url.path
+        logger.info("request_start", request_id=request_id, method=method, path=path)
         try:
             response = await call_next(request)
-            logger.info("request_end", status_code=response.status_code)
+            logger.info(
+                "request_end",
+                request_id=request_id,
+                method=method,
+                path=path,
+                status_code=response.status_code,
+            )
             return response
         except Exception:
-            logger.exception("request_error")
+            logger.exception("request_error", request_id=request_id, method=method, path=path)
             raise
-        finally:
-            clear_context()
 
     @app.post("/agent")
-    async def agent_endpoint(input_data: RunAgentInput, request: Request):
-        rate_limiter = get_rate_limiter()
-        queue = get_queue()
-
-        client_ip = request.client.host if request.client else "unknown"
-        user_id = input_data.thread_id or client_ip
-
-        bind_context(
-            thread_id=input_data.thread_id,
-            run_id=input_data.run_id,
-            user_id=user_id,
-        )
+    @inject
+    async def agent_endpoint(
+        input_data: RunAgentInput,
+        request: Request,
+        rate_limiter = Provide[ApplicationContainer.rate_limiter],
+        queue = Provide[ApplicationContainer.queue],
+        settings = Provide[ApplicationContainer.settings],
+    ):
+        user_id = request.headers.get("X-User-Id", "anonymous")
 
         result = await rate_limiter.check(user_id)
         if not result.allowed:
@@ -169,9 +146,7 @@ def create_app() -> FastAPI:
                 },
             )
 
-        run_id = await queue.publish(
-            get_settings().agent_name, input_data
-        )
+        run_id = await queue.publish(settings.agent_name, input_data)
         encoder = EventEncoder(
             accept=request.headers.get("accept", "text/event-stream")
         )
@@ -179,7 +154,9 @@ def create_app() -> FastAPI:
         logger.info(
             "agent_request_queued",
             run_id=run_id,
-            agent=get_settings().agent_name,
+            agent=settings.agent_name,
+            user_id=user_id,
+            thread_id=input_data.thread_id,
         )
 
         async def event_generator():
@@ -187,7 +164,7 @@ def create_app() -> FastAPI:
                 async for event in queue.subscribe(run_id):
                     yield encoder.encode(event)
             except Exception:
-                logger.exception("sse_stream_error")
+                logger.exception("sse_stream_error", run_id=run_id)
                 raise
 
         return StreamingResponse(
@@ -196,68 +173,45 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/agent/health")
-    async def agent_health():
+    @inject
+    async def agent_health(settings = Provide[ApplicationContainer.settings]):
         return {
             "status": "ok",
-            "agent": {"name": get_settings().agent_name},
+            "agent": {"name": settings.agent_name},
         }
 
     @app.get("/health")
-    async def health():
-        return {"status": "ok", "service": get_settings().app_name}
+    @inject
+    async def health(settings = Provide[ApplicationContainer.settings]):
+        return {"status": "ok", "service": settings.app_name}
 
     @app.get("/agents")
-    async def list_agents():
+    @inject
+    async def list_agents(settings = Provide[ApplicationContainer.settings]):
         return {
             "agents": [
                 {
-                    "name": get_settings().agent_name,
+                    "name": settings.agent_name,
                     "endpoint": "/agent",
                 }
             ]
         }
 
-    @app.post("/threads", response_model=ThreadResponse)
-    async def create_thread(body: ThreadCreate):
-        tid = body.thread_id or str(uuid.uuid4())
-        _threads[tid] = {"thread_id": tid, "metadata": body.metadata or {}}
-
-        # Initialize checkpointer state so GET .../state has a record
-        config = {"configurable": {"thread_id": tid}}
-        try:
-            await agent_graph.aupdate_state(
-                config, {"messages": []}, as_node="agent"
-            )
-        except Exception:
-            logger.info(
-                "create_thread_checkpointer_skip",
-                thread_id=tid,
-            )
-
-        logger.info("thread_created", thread_id=tid)
-        return _threads[tid]
-
-    @app.get("/threads")
-    async def list_threads():
-        return {"threads": list(_threads.values())}
-
-    @app.get("/threads/{thread_id}")
-    async def get_thread(thread_id: str):
-        thread = _threads.get(thread_id)
-        if not thread:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        return thread
-
     @app.get("/threads/{thread_id}/state/history")
-    async def get_thread_state_history(thread_id: str):
+    @inject
+    async def get_thread_state_history(thread_id: str, graph = Provide[ApplicationContainer.graph]):
         config = {"configurable": {"thread_id": thread_id}}
         from ag_ui_langgraph.utils import langchain_messages_to_agui
 
         entries = []
         try:
-            async for snapshot in agent_graph.aget_state_history(config):
-                messages = langchain_messages_to_agui(
-                    snapshot.values.get("messages", []) if snapshot.values else []
+            async for snapshot in graph.aget_state_history(config):
+                agui_messages = (
+                    langchain_messages_to_agui(
+                        snapshot.values.get("messages", [])
+                    )
+                    if snapshot.values
+                    else []
                 )
                 entries.append(
                     {
@@ -266,85 +220,154 @@ def create_app() -> FastAPI:
                         )
                         if snapshot.config and snapshot.config.get("configurable")
                         else None,
-                        "message_count": len(messages),
+                        "message_count": len(agui_messages),
+                        "messages": agui_messages,
                         "next": list(snapshot.next) if snapshot.next else [],
                     }
                 )
         except Exception:
-            logger.exception("get_thread_state_history_error", thread_id=thread_id)
+            logger.exception(
+                "get_thread_state_history_error", thread_id=thread_id
+            )
             raise HTTPException(
                 status_code=500, detail="Failed to read state history"
             )
 
         return {"thread_id": thread_id, "checkpoints": entries}
 
-    @app.delete("/threads/{thread_id}")
-    async def delete_thread(thread_id: str):
-        _threads.pop(thread_id, None)
-        # Clear checkpointer state
-        try:
-            await get_checkpointer().adelete_thread(thread_id)
-        except Exception:
-            logger.exception("delete_thread_checkpointer_error", thread_id=thread_id)
-        logger.info("thread_deleted", thread_id=thread_id)
-        return {"status": "deleted", "thread_id": thread_id}
-
     @app.get("/threads/{thread_id}/state")
-    async def get_thread_state(thread_id: str):
+    @inject
+    async def get_thread_state(thread_id: str, graph = Provide[ApplicationContainer.graph]):
         config = {"configurable": {"thread_id": thread_id}}
         try:
-            state = await agent_graph.aget_state(config)
+            state = await graph.aget_state(config)
         except Exception:
             logger.exception("get_thread_state_error", thread_id=thread_id)
-            raise HTTPException(status_code=500, detail="Failed to read thread state")
+            raise HTTPException(
+                status_code=500, detail="Failed to read thread state"
+            )
 
         if state.values is None:
             logger.info("get_thread_state_empty", thread_id=thread_id)
             return {"thread_id": thread_id, "messages": []}
 
         from ag_ui_langgraph.utils import langchain_messages_to_agui
+        from langchain_core.messages.modifier import RemoveMessage
 
         raw = state.values.get("messages", [])
-        logger.info(
-            "get_thread_state_found",
-            thread_id=thread_id,
-            message_count=len(raw),
+        clean = [m for m in raw if not isinstance(m, RemoveMessage)]
+        messages = langchain_messages_to_agui(clean)
+        checkpoint_id = (
+            state.config.get("configurable", {}).get("checkpoint_id")
+            if state.config else None
         )
-        messages = langchain_messages_to_agui(raw)
-        return {"thread_id": thread_id, "messages": messages}
+        return {"thread_id": thread_id, "checkpoint_id": checkpoint_id, "messages": messages}
 
-    @app.put("/threads/{thread_id}/state")
-    async def update_thread_state(thread_id: str, body: ThreadStateUpdate):
-        from ag_ui_langgraph.utils import agui_messages_to_langchain
+    @app.patch("/threads/{thread_id}/state")
+    @inject
+    async def update_thread_state(
+        thread_id: str,
+        body: UpdateStateRequest,
+        graph = Provide[ApplicationContainer.graph],
+    ):
+        if not body.messages:
+            raise HTTPException(status_code=400, detail="messages required")
 
-        agui_messages = [
-            _get_agui_message_class(m["role"])(**m) for m in body.messages
-        ]
-        langchain_messages = agui_messages_to_langchain(agui_messages)
-        config = {"configurable": {"thread_id": thread_id}}
+        from ag_ui_langgraph.utils import agui_messages_to_langchain, langchain_messages_to_agui
+        from langchain_core.messages.modifier import RemoveMessage
 
-        try:
-            # as_node="agent" is required for LangGraph checkpointer
-            # to disambiguate which node produced the update
-            await agent_graph.aupdate_state(
-                config, {"messages": langchain_messages}, as_node="agent"
+        agui_objects = [_to_agui_message(m) for m in body.messages]
+        lc_messages = agui_messages_to_langchain(agui_objects)
+        edited_ids = {getattr(m, "id", None) for m in lc_messages}
+
+        # Load the *latest* checkpoint of this thread.
+        latest_config = {"configurable": {"thread_id": thread_id}}
+        latest_snap = await graph.aget_state(latest_config)
+        current = list(latest_snap.values.get("messages", [])) if latest_snap.values else []
+
+        # Find the last position of any edited message in the current list.
+        last_edited_idx = -1
+        for idx, m in enumerate(current):
+            if getattr(m, "id", None) in edited_ids:
+                last_edited_idx = idx
+
+        if last_edited_idx == -1:
+            raise HTTPException(
+                status_code=404,
+                detail="Edited message not found in the latest thread state",
             )
-        except Exception:
-            logger.exception("update_thread_state_error", thread_id=thread_id)
-            raise HTTPException(status_code=500, detail="Failed to save thread state")
 
-        state = await agent_graph.aget_state(config)
-        raw = state.values.get("messages", []) if state.values else []
+        # Build clean message list: keep before edit, replace edited, drop rest.
+        new_msgs = []
+        for m in current[:last_edited_idx + 1]:
+            mid = getattr(m, "id", None)
+            if mid in edited_ids:
+                for em in lc_messages:
+                    if getattr(em, "id", None) == mid:
+                        new_msgs.append(em)
+                        break
+            else:
+                new_msgs.append(m)
 
-        if state.values is None:
-            logger.warning("update_thread_state_no_values", thread_id=thread_id)
-            return {"thread_id": thread_id, "messages": []}
+        # Write via aupdate_state — cleanest approach, no RemoveMessage artifacts
+        await graph.aupdate_state(latest_config, {"messages": new_msgs})
 
-        from ag_ui_langgraph.utils import langchain_messages_to_agui
+        # Read back, filter any leftover RemoveMessage artifacts from prior corruptions
+        # (can happen when tool messages had id=None on this thread).
+        new_state = await graph.aget_state(latest_config)
+        raw = list(new_state.values.get("messages", [])) if new_state.values else []
+        raw = [m for m in raw if not isinstance(m, RemoveMessage)]
+        checkpoint_id = (
+            new_state.config.get("configurable", {}).get("checkpoint_id")
+            if new_state.config else None
+        )
+        agui_msgs = langchain_messages_to_agui(raw)
 
         return {
             "thread_id": thread_id,
-            "messages": langchain_messages_to_agui(raw),
+            "checkpoint_id": checkpoint_id,
+            "messages": agui_msgs,
+        }
+
+    @app.post("/threads/{thread_id}/fork")
+    @inject
+    async def fork_thread(
+        thread_id: str,
+        body: ForkThreadRequest,
+        graph = Provide[ApplicationContainer.graph],
+    ):
+        source_config = {"configurable": {"thread_id": thread_id}}
+        if body.source_checkpoint_id:
+            source_config["configurable"]["checkpoint_id"] = body.source_checkpoint_id
+
+        source_state = await graph.aget_state(source_config)
+        if source_state.values is None:
+            raise HTTPException(status_code=404, detail="Source thread has no state")
+
+        new_thread_id = body.new_thread_id or str(uuid.uuid4())
+        new_config = {"configurable": {"thread_id": new_thread_id}}
+
+        # aupdate_state does NOT persist DeltaChannel writes on brand-new
+        # threads (aput_writes is skipped when saved=None).  astream is the
+        # only robust way to initialise a new thread with full middleware
+        # processing for deepagents.
+        stream = graph.astream(
+            dict(source_state.values),
+            stream_mode="updates",
+            config=new_config,
+            interrupt_before=["model"],
+        )
+        async for _ in stream:
+            pass
+
+        target_state = await graph.aget_state({"configurable": {"thread_id": new_thread_id}})
+        from ag_ui_langgraph.utils import langchain_messages_to_agui
+
+        raw = (target_state.values or {}).get("messages", [])
+        agui_msgs = langchain_messages_to_agui(raw)
+        return {
+            "thread_id": new_thread_id,
+            "messages": agui_msgs,
         }
 
     return app

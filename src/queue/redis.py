@@ -4,13 +4,15 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
 import redis.asyncio as aioredis
+from langchain_core.runnables import RunnableConfig, ensure_config
 
 from ag_ui.core import BaseEvent, EventType, RunAgentInput
+from ag_ui_langgraph import LangGraphAgent
 
-from src.queue.protocol import MessageQueue
+from src.queue.protocol import MessageQueue, Worker
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +25,6 @@ class RedisStreamQueue(MessageQueue):
     def __init__(self, redis_url: str):
         self._redis_url = redis_url
         self._redis: aioredis.Redis | None = None
-        self._agents: dict[str, Any] = {}
-        self._worker_task: asyncio.Task | None = None
-        self._running = False
 
     async def _get_redis(self) -> aioredis.Redis:
         if self._redis is None:
@@ -37,13 +36,14 @@ class RedisStreamQueue(MessageQueue):
     async def publish(self, agent_name: str, input: RunAgentInput) -> str:
         r = await self._get_redis()
         run_id = input.run_id or str(uuid.uuid4())
+        input_with_id = input.model_copy(update={"run_id": run_id})
 
         await r.xadd(
             STREAM_KEY,
             {
                 "agent_name": agent_name,
                 "run_id": run_id,
-                "payload": input.model_dump_json(exclude_none=True),
+                "payload": input_with_id.model_dump_json(),
             },
             maxlen=10000,
         )
@@ -68,15 +68,27 @@ class RedisStreamQueue(MessageQueue):
             await pubsub.unsubscribe(channel)
             await pubsub.close()
 
-    async def start_worker(self, agents: dict[str, Any] | None = None) -> None:
-        if agents:
-            self._agents = agents
+    async def shutdown(self) -> None:
+        if self._redis:
+            await self._redis.close()
+        logger.info("RedisStreamQueue shut down")
+
+
+class RedisStreamWorker(Worker):
+    def __init__(self, queue: RedisStreamQueue):
+        self._queue = queue
+        self._agents: dict[str, LangGraphAgent] = {}
+        self._task: asyncio.Task | None = None
+        self._running = False
+
+    async def start(self, agents: dict[str, LangGraphAgent]) -> None:
+        self._agents = agents
         self._running = True
-        self._worker_task = asyncio.create_task(self._worker_loop())
-        logger.info("RedisStreamQueue worker started")
+        self._task = asyncio.create_task(self._worker_loop())
+        logger.info("RedisStreamWorker started")
 
     async def _worker_loop(self) -> None:
-        r = await self._get_redis()
+        r = await self._queue._get_redis()
 
         try:
             await r.xgroup_create(STREAM_KEY, CONSUMER_GROUP, mkstream=True)
@@ -105,7 +117,7 @@ class RedisStreamQueue(MessageQueue):
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception("RedisStreamQueue worker error")
+                logger.exception("RedisStreamWorker error")
                 await asyncio.sleep(1)
 
     async def _process_entry(
@@ -128,11 +140,46 @@ class RedisStreamQueue(MessageQueue):
             return
 
         agent = self._agents[agent_name].clone()
+
+        # Inject dataset_ids from forwarded_props into agent config so tools
+        # can access them via ToolRuntime.config["configurable"]["dataset_ids"]
+        forwarded = payload.forwarded_props or {}
+        if isinstance(forwarded, dict):
+            ds_ids = forwarded.get("dataset_ids")
+            if ds_ids is not None:
+                cfg: RunnableConfig = ensure_config(
+                    dict(agent.config) if agent.config else {}
+                )
+                cfg.setdefault("configurable", {})["dataset_ids"] = ds_ids
+                agent.config = cfg
+
         channel = f"{EVENT_CHANNEL_PREFIX}{run_id}"
 
         logger.info("Worker processing run_id=%s agent=%s", run_id, agent_name)
 
+        # Use checkpoint as source of truth, only accept truly new user messages from client
+        from ag_ui_langgraph.utils import langchain_messages_to_agui
+        from langchain_core.messages.modifier import RemoveMessage
+
+        state = await agent.graph.aget_state({"configurable": {"thread_id": payload.thread_id}})
+        checkpoint_raw = list(state.values.get("messages", [])) if state.values else []
+        checkpoint_msgs = [m for m in checkpoint_raw if not isinstance(m, RemoveMessage)]
+        checkpoint_agui = langchain_messages_to_agui(checkpoint_msgs)
+        checkpoint_agui_ids = {m.id for m in checkpoint_agui if m.id}
+
+        new_user_msgs = [m for m in (payload.messages or [])
+                         if getattr(m, 'role', None) == 'user'
+                         and getattr(m, 'id', None)
+                         and m.id not in checkpoint_agui_ids]
+
+        if new_user_msgs:
+            payload.messages = [*checkpoint_agui, *new_user_msgs]
+        else:
+            payload.messages = checkpoint_agui
+
         async for event in agent.run(payload):
+            if event.type == EventType.TEXT_MESSAGE_CONTENT or event.type == EventType.TOOL_CALL_ARGS:
+                logger.info("[LLM] %s", event.model_dump_json(exclude_none=True))
             await r.publish(
                 channel, event.model_dump_json(exclude_none=True)
             )
@@ -142,12 +189,11 @@ class RedisStreamQueue(MessageQueue):
 
     async def shutdown(self) -> None:
         self._running = False
-        if self._worker_task:
-            self._worker_task.cancel()
+        if self._task:
+            self._task.cancel()
             try:
-                await self._worker_task
+                await self._task
             except asyncio.CancelledError:
                 pass
-        if self._redis:
-            await self._redis.close()
-        logger.info("RedisStreamQueue worker stopped")
+        logger.info("RedisStreamWorker stopped")
+
